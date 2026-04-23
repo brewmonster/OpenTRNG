@@ -4,17 +4,17 @@ project('number-generator-app', 'cpp',
   
 # 1. Find the libcamera dependency (uses pkg-config under the hood)
 libcamera_dep = dependency('libcamera', required : true)
-#openssl_dep = dependency('openssl', required : true)
+openssl_dep = dependency('openssl', required : true)
 
 # 2. Identify your source files
 sources = [
-  'main.cpp'
-  # for later
+  'main.cpp',
+  'EntropySource.cpp'
 ]
 
 # 3. Define the executable
 executable('rng_bin',
   sources,
-  #dependencies : libcamera_dep, openssl_dep,
-  dependencies : libcamera_dep,
+  dependencies : [libcamera_dep, openssl_dep],
+  #dependencies : libcamera_dep,
   install : true)
