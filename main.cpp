@@ -1,5 +1,6 @@
 #include <iomanip>
 #include <iostream>
+#include <bitset>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -9,79 +10,24 @@
 #include <sys/mman.h> // for accessing dma data
 
 #include <libcamera/libcamera.h>
+#include "EntropySource.hpp"
 
 using namespace libcamera;
 using namespace std::chrono_literals;
 
-static std::shared_ptr<Camera> camera;
+static std::unique_ptr<CameraManager> cm;
+static std::vector<std::unique_ptr<Request>> requests;
 
 Request* currentRequest = nullptr;
 Request* oldRequest = nullptr;
 
 Stream* stream = nullptr;
 
-static std::map<FrameBuffer*, uint8_t*> bufferMappedData; // Map buffer pointers to mapped data
-
-
-
-uint8_t* processBuffer(FrameBuffer* bufferPtr) { 
-    struct dma_buf_sync sync = {0};
-
-    int fd = bufferPtr->planes()[0].fd.get();
-
-    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ; 
-    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-
-    // Now it is safe to compare bits in mappedData
-    uint8_t* mappedData = bufferMappedData[bufferPtr]; // Retrieve the mapped data pointer for this buffer
-
-    // --- STEP 3: END SYNC ---
-    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-    ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
-    return mappedData;
-}
-
-void compareBuffers(uint8_t* currentData, uint8_t* oldData, size_t length) {
-    // Example comparison: Calculate the sum of absolute differences
-    uint64_t sumAbsDiff = 0;
-    for (size_t i = 0; i < length; ++i) {
-        sumAbsDiff += currentData[i] ^ oldData[i]; // get difference in each byte and add to sum
-    }
-    std::cout << "Sum of Absolute Differences: " << sumAbsDiff << std::endl;
-}
-
-void requestComplete(Request *request) {
-    if (request->status() == Request::RequestCancelled) return;
-
-    // if oldRequest is not nullptr, then use oldRequest buffer as the new request aka flipflopping between buffers
-    if (oldRequest) {
-        oldRequest->reuse(Request::ReuseBuffers);
-        camera->queueRequest(oldRequest);
-    } 
-    
-    oldRequest = currentRequest; 
-    currentRequest = request;    // The frame that just arrived
-
-    if (oldRequest && currentRequest) {
-       
-        // grab the buffer pointer of the requests
-        FrameBuffer* currentBufferPtr = currentRequest->findBuffer(stream);
-        FrameBuffer* oldBufferPtr = oldRequest->findBuffer(stream);
-
-        // before 
-        uint8_t* currentMappedData = processBuffer(currentBufferPtr);
-        uint8_t* oldMappedData = processBuffer(oldBufferPtr);
-
-        compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length);
-    }
-}
-
-
 int init(){
 
     // ------------------------ SETTING UP CAMERA MANAGER ------------------------
 
-    std::unique_ptr<CameraManager> cm = std::make_unique<CameraManager>();
+    cm = std::make_unique<CameraManager>();
     cm->start();
     for (auto const &camera : cm->cameras()) std::cout << camera->id() << std::endl;
 
@@ -91,6 +37,11 @@ int init(){
                 << std::endl;
         cm->stop();
         return EXIT_FAILURE;
+    }
+
+    for (auto cam : cameras){
+        std::shared_ptr<Camera> camera = cm->get(cam->id());
+
     }
 
     std::string cameraId = cameras[0]->id();
@@ -105,9 +56,9 @@ int init(){
 
     // ------------------------ SETTING UP CAMERA CONFIGURATION ------------------------
 
-    std::unique_ptr<CameraConfiguration> config = camera->generateConfiguration( { StreamRole::Viewfinder } );
+    std::unique_ptr<CameraConfiguration> config = camera->generateConfiguration( { StreamRole::Raw } );
     StreamConfiguration &streamConfig = config->at(0); 
-    streamConfig.pixelFormat = formats::NV12;
+    streamConfig.pixelFormat = formats::SGBRG10_CSI2P;
 
     camera->configure(config.get());
 
@@ -154,7 +105,6 @@ int init(){
 
     stream = streamConfig.stream();
     const std::vector<std::unique_ptr<FrameBuffer>> &buffers = allocator->buffers(stream);
-    std::vector<std::unique_ptr<Request>> requests;
 
     for (unsigned int i = 0; i < buffers.size(); i++) { // looping through all the buffers and adding them to the request
         std::unique_ptr<Request> request = camera->createRequest();
@@ -176,10 +126,15 @@ int init(){
         requests.push_back(std::move(request));
     }
 
-    currentRequest = requests[0].get(); // set the first request as the current request to start with
-
+    
     camera->requestCompleted.connect(requestComplete);
+    
+    camera->start();
 
+    oldRequest = requests[0].get(); // set the first request as the current request to start with
+    currentRequest = requests[1].get(); // set the second request as the old request to start with
+    
+    camera->queueRequest(oldRequest);
     
 
     // ------------------------ STARTING THE DISPLAY WINDOW ------------------------
@@ -197,8 +152,7 @@ int main()
         std::cerr << "Failed to initialize camera manager" << std::endl;
         return -1;
     }
-    camera->start();
-    camera->queueRequest(currentRequest);
+    while (1);
 
     return 0;
 }
