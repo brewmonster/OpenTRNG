@@ -24,6 +24,10 @@
 #include <libcamera/libcamera.h>
 
 
+#include "MarkovEstimator.hpp"
+#include "EntropyCalibrator.hpp"
+
+
 using namespace libcamera;
 using namespace std::chrono_literals;
 
@@ -49,10 +53,14 @@ class EntropySource {
         size_t queueLimit;
         Request* currentRequest = nullptr;
         Request* oldRequest = nullptr;
+		
+		CalibrationResult calibrationResult{};
+		
+
 
         Stream* stream = nullptr;
         
-        std::vector<uint8_t> dataFrame;
+
 
         std::map<const int, uint8_t*> bufferMappedData; // Map buffer pointers to mapped data
         
@@ -65,16 +73,20 @@ class EntropySource {
         std::mutex pendingMutex;
         std::condition_variable pendingCV;
         
-        
         void processRequest(Request *request);
 
     public:
     
-        EntropySource(std::shared_ptr<Camera> _camera, std::queue<std::vector<uint8_t>*>* _queue, const std::atomic<bool>* _running, std::mutex& _frame_queue_mutex);
+        EntropySource(std::shared_ptr<Camera> _camera, 
+			std::queue<std::vector<uint8_t>*>* _queue, 
+			const std::atomic<bool>* _running, 
+			std::mutex& _frame_queue_mutex);
         
         EntropySource();
 
         ~EntropySource();
+		
+		void calibrate(uint32_t timeout_ms = 30000, bool force_calibrate = false);
         
         void requestComplete(Request *request);
         

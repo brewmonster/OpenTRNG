@@ -1,25 +1,8 @@
-#include <iomanip>
-#include <iostream>
-#include <bitset>
-#include <memory>
-#include <thread>
-#include <vector>
-#include <atomic>
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-    
-
-#include <linux/dma-buf.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h> // for accessing dma data
-
-#include <libcamera/libcamera.h>
 #include "EntropySource.hpp"
-
 
 using namespace libcamera;
 using namespace std::chrono_literals;
+
 
 // expected size of data 
 size_t EntropySource::size(){
@@ -31,7 +14,7 @@ size_t EntropySource::size(){
     if (format == Mode::RAW) return planes[0].length / 5; // optimised to use only 1/5 bytes 
     if (format == Mode::GREYSCALE) return planes[0].length + planes[1].length + planes[2].length; // multiple planes, so total size is the sum of all plane sizes
     if (format == Mode::RGB) return planes[0].length * 4; // 4 bytes for every 1 pixel (1 pixel is actually 4 raw pixels)
-    return -1; // idk how this can happen but who knows
+    return 0; 
 }
 
 uint8_t* EntropySource::processBuffer(FrameBuffer* bufferPtr) { 
@@ -54,20 +37,21 @@ uint8_t* EntropySource::processBuffer(FrameBuffer* bufferPtr) {
 std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t* oldData, size_t length) {
     // Example comparison: Calculate the sum of absolute differences
     // std::stringstream stream;
-    std::vector<uint8_t> data; 
-	
+    std::vector<uint8_t> data;
+	int shift_amount = 0;
 	
 	// every 5th byte is 2 LSB its from the last 4 pixels, 
 	// to reduce bias, rotate byte based on index to set MSBs to different colour wells
     if (format == Mode::RAW) {
 		data.reserve(length / 5);
-		int shift_amount = 0;
+		
 		for (size_t i = 4; i < length / 5; i+=5) { 
 //			data.push_back(std::rotl( static_cast<uint8_t> (currentData[i]), shift_amount));
-			uint8_t piece = std::rotl( static_cast<uint8_t> (currentData[i] ^ oldData[i]), shift_amount); // USE -Og or something to debug idk
-			data.push_back(piece); 
- 
-			if (shift_amount+=2 == 8) shift_amount = 0;
+			uint8_t byte = std::rotl(static_cast<uint8_t> (currentData[i] ^ oldData[i]), shift_amount); 
+			if (byte) {
+				data.push_back(byte);
+				if ((shift_amount+=1)>= 8) shift_amount = 0;
+			}
 		}
 		
 		return data;
@@ -91,7 +75,7 @@ std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t
 		uint8_t shift_amount = 0;
 		
 		for (size_t i = 0; i < length; i++) { 
-			if (!(i+1)%4){ // if not padding byte
+			if ((i+1)%4){ // if not padding byte
 				if (shift_amount+=2 == 8) {
 					shift_amount = 0;
 					current_byte = 0; // new byte
@@ -106,33 +90,19 @@ std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t
 	return {};
 }
 
+// swap requests, process inbound data, send to main to be written
 void EntropySource::processRequest(Request *request) {
     // std::cout << "Request completed with status: " << request->status() << std::endl;
 
     if (request->status() == Request::RequestCancelled) return;
     
-
-    oldRequest = currentRequest; 
+	// flip flop between 2 buffers
+    oldRequest = currentRequest; // frame from before
     currentRequest = request;    // The frame that just arrived
-
-    if (oldRequest && currentRequest) {
-       
-        // grab the buffer pointer of the requests
-        FrameBuffer* currentBufferPtr = currentRequest->findBuffer(stream);
-        FrameBuffer* oldBufferPtr = oldRequest->findBuffer(stream);
-
-        // before 
-        uint8_t* currentMappedData = processBuffer(currentBufferPtr);
-        uint8_t* oldMappedData = processBuffer(oldBufferPtr);
-
-        std::vector<uint8_t>* newData = new std::vector<uint8_t>(compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length)); 
-		std::lock_guard<std::mutex> lock(frm_q_mtx);
-        if (queue->size() < queueLimit){
-            queue->push(newData); // pushing the mapped data pointer and its length as a pair into the queue
-        }
-    }
-
-    if (oldRequest) {
+	
+	// on first run only currentRequest holds a valid request, so can't flipflip yet 
+	// preloading the next request, since request processing will almost always take longer than the camera frame rate
+    if (oldRequest) { 
         oldRequest->reuse(Request::ReuseBuffers);
         camera->queueRequest(oldRequest);
     } else {
@@ -140,6 +110,25 @@ void EntropySource::processRequest(Request *request) {
         currentRequest->reuse(Request::ReuseBuffers);
         camera->queueRequest(currentRequest);
     }
+
+    if (oldRequest && currentRequest) {
+       
+        // grab the buffer pointer of the requests
+        FrameBuffer* currentBufferPtr = currentRequest->findBuffer(stream);
+        FrameBuffer* oldBufferPtr = oldRequest->findBuffer(stream);
+
+        // getting virtual memory pointer equiavlent to the dma fd
+        uint8_t* currentMappedData = processBuffer(currentBufferPtr);
+        uint8_t* oldMappedData = processBuffer(oldBufferPtr);
+
+        std::vector<uint8_t>* frame_diff = new std::vector<uint8_t>(compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length)); 
+		
+		std::lock_guard<std::mutex> lock(frm_q_mtx);
+        if (queue->size() < queueLimit){ // ensure requests are bound by the data processing, as to not cause a memory leak
+            queue->push(frame_diff); // pushing the mapped data pointer into the queue
+        }
+    }
+	
 }
 
 void EntropySource::workingLoop() {
@@ -149,7 +138,7 @@ void EntropySource::workingLoop() {
     while (running) {
         Request* request;
         {
-            std::unique_lock<std::mutex> lock(pendingMutex);
+            std::unique_lock<std::mutex> lock(pendingMutex); // when request completed, process it when not being accesed.
             pendingCV.wait(lock, [this]{ return !pendingRequests.empty() || !running; });
             if (!running) break;
             request = pendingRequests.front();
@@ -160,7 +149,7 @@ void EntropySource::workingLoop() {
     }
 }
 
-void EntropySource::requestComplete(Request *request) {
+void EntropySource::requestComplete(Request *request) { 
     if (request->status() == Request::RequestCancelled) return;
     {
         std::lock_guard<std::mutex> lock(pendingMutex);
@@ -216,7 +205,7 @@ formatExit:
 
     // ------------------------ SETTING UP FRAME BUFFERS ------------------------
 
-    // allocating minimum buffers
+    // allocating buffers requested by the camera
 
     FrameBufferAllocator *allocator = new FrameBufferAllocator(camera);
 	
@@ -261,7 +250,7 @@ formatExit:
 			bufferMappedData[fd] = mappedData; // setting the buffer pointer as key and mapped data pointer as value in the map
 		} 
 		
-		// planar data needs multiple maps
+		// planar data needs multiple maps for each plane
 		else{
 			for (const auto &plane : buffer->planes()) {
 				int fd = plane.fd.get();
@@ -303,24 +292,58 @@ formatExit:
     
     
     camera->requestCompleted.connect(this, &EntropySource::requestComplete);
-    
-    camera->start();
 
-    oldRequest = requests[0].get(); // set the first request as the current request to start with
-    currentRequest = requests[1].get(); // set the second request as the old request to start with
-    
-    camera->queueRequest(oldRequest);
-	
-	dataFrame.resize(this->size()); // set data to the length for the current format
+	libcamera::ControlList startControls(libcamera::controls::controls);
+	startControls.set(libcamera::controls::AeEnable,  false);
+	startControls.set(libcamera::controls::AwbEnable, false);
+	camera->start(&startControls);
 
+	oldRequest = requests[0].get();
+	currentRequest = requests[1].get();
 
-    // std::cout<< "Camera:" << properties." loaded"; 
+	camera->queueRequest(oldRequest); // start flipflop
+
     return 0;
 }
 
+void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate) {
+	
+    EntropyCalibrator cal(camera, stream);
 
-EntropySource::EntropySource(std::shared_ptr<Camera> _camera, std::queue<std::vector<uint8_t>*>* _queue, const std::atomic<bool>* _running, std::mutex& _frame_queue_mutex) 
-    : camera(_camera), queue(_queue), running(_running), frm_q_mtx(_frame_queue_mutex) {}
+    auto frameCallback = [this](std::vector<uint8_t>& accum, size_t nFrames, int32_t exposureUs, float analogueGain) {
+        size_t collected = 0;
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+		
+        while (collected < nFrames && std::chrono::steady_clock::now() < deadline) {
+			if (collected < 2) { // first 2 new requests need controls applied
+				auto controls = currentRequest->controls();
+					controls.set(libcamera::controls::AeEnable,     false);
+					controls.set(libcamera::controls::AwbEnable,    false);
+					controls.set(libcamera::controls::ExposureTime, exposureUs);
+					controls.set(libcamera::controls::AnalogueGain, analogueGain);
+			}
+            std::vector<uint8_t>* frame = nullptr;
+
+			if (!queue->empty()) { frame = queue->front(); queue->pop(); }
+            if (!frame) { 
+				std::this_thread::sleep_for(std::chrono::milliseconds(5)); 
+				continue;
+			}
+            accum.insert(accum.end(), frame->begin(), frame->end());
+            delete frame;
+            ++collected;
+        }
+    };
+	
+    cal.run(frameCallback, timeout_ms);
+}
+
+
+EntropySource::EntropySource(std::shared_ptr<Camera> _camera, 
+	std::queue<std::vector<uint8_t>*>* _queue, 
+	const std::atomic<bool>* _running, 
+	std::mutex& _frame_queue_mutex) 
+	: camera(_camera), queue(_queue), running(_running), frm_q_mtx(_frame_queue_mutex) {}
 
 EntropySource::~EntropySource(){
     camera->stop();

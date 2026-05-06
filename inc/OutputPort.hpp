@@ -14,6 +14,8 @@
 #include <fstream>
 #include <stdexcept>
 #include <limits>
+#include <chrono>
+#include <ctime>
 
 #include <poll.h>
 #include <fcntl.h>
@@ -40,8 +42,10 @@ static constexpr size_t GCM_TAG_LEN   = 16; // 128-bit authentication tag
 struct OutputFlags {
     bool forceSerial  = false; // -s / --serial
     bool noPrompt     = false; // -n / --no-input  (skip y/n, take defaults)
-	bool quiet		  = false; // -q / shuddup
-	bool pseudo		  = false; // --p / prng to increase throughput.
+	bool verbose		  = false; // -q / 
+	bool pseudo		  = false; // -p / prng to increase throughput.
+	bool logging	  = false; // -l /
+	bool force_calibrate	= false; // -l /
 };
 
 std::vector<uint8_t> loadSharedKey(const std::string& path = "/key");
@@ -58,8 +62,8 @@ public:
     virtual bool open() = 0;
     virtual void writeData(const uint8_t* data, size_t length) = 0;
     virtual void close() = 0;
+	virtual std::string getMessage() = 0;
 };
-
 
 // ======================== SERIAL (IF GADGET MODE EXISTS) ========================
 
@@ -70,6 +74,7 @@ public:
     bool open() override;
     void writeData(const uint8_t* data, size_t length) override;
     void close() override;
+	std::string getMessage() override;
 
 private:
     std::string device;
@@ -99,6 +104,7 @@ private:
 
 class TCPServer : public DataSink {
 public:
+	
     explicit TCPServer(uint16_t port, std::vector<uint8_t> key);
     ~TCPServer();
     bool open() override;
@@ -109,6 +115,8 @@ public:
     void writeData(const uint8_t* data, size_t length) override;
 
     void close() override;
+	
+	std::string getMessage() override;
 
 private:
     uint16_t port;
@@ -134,9 +142,12 @@ public:
     // flags come from CLI parsing in main().
     bool init(const OutputFlags& flags);
     void writeData(const uint8_t* data, size_t length);
+	void startLog(const OutputFlags& flgs);
+	bool writeToFile(const char* data, size_t length);
 
 private:
     std::unique_ptr<DataSink> sink;
+	bool isLogging;
 
     static bool isGadgetModeAvailable();
     static bool promptYN(const std::string& question, bool noPrompt, bool defaultYes = true);

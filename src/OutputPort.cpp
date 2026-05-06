@@ -1,5 +1,6 @@
 #include "OutputPort.hpp"
 
+
 // ======================== KEY LOADING ========================
 
 std::vector<uint8_t> loadSharedKey(const std::string& path) {
@@ -92,6 +93,7 @@ bool SerialPort::open() {
     running = true;
     writeThread = std::thread(&SerialPort::writerLoop, this);
     std::cout << "Gadget serial open on " << device << std::endl;
+	
     return true;
 }
 
@@ -119,6 +121,7 @@ void SerialPort::writerLoop() {
             writeQueue.pop();
         }
         writeAll(buf->data(), buf->size());
+
     }
 }
 
@@ -135,6 +138,7 @@ bool SerialPort::writeAll(const uint8_t* data, size_t length) {
     }
     return true;
 }
+
 
 
 // ======================== TCP SERVER ========================
@@ -176,6 +180,9 @@ bool TCPServer::open() {
 
     std::cout << "TCP server listening on port " << port
               << " — waiting for client..." << std::endl;
+	
+
+
     return true;
 }
 
@@ -196,6 +203,7 @@ void TCPServer::pollAccept() {
 
     if (clientFd >= 0) ::close(clientFd);
     clientFd = newFd;
+	
 }
 
 void TCPServer::writeData(const uint8_t* data, size_t length) {
@@ -214,7 +222,7 @@ void TCPServer::writeData(const uint8_t* data, size_t length) {
     if (!writeAll(clientFd, frame.data(), frame.size())) {
         std::cout << "Client disconnected, waiting for reconnect..." << std::endl;
         ::close(clientFd);
-        clientFd = -1;
+        clientFd = -1; // removing the client 
     }
 }
 
@@ -235,6 +243,8 @@ bool TCPServer::writeAll(int fd, const uint8_t* data, size_t length) {
     }
     return true;
 }
+
+
 
 
 // ======================== OUTPUT PORT ========================
@@ -304,8 +314,62 @@ bool OutputPort::promptKey(const std::string& path) {
     return true;
 }
 
-bool OutputPort::init(const OutputFlags& flags) {
+std::string SerialPort::getMessage(){
+	std::string s = "Using Serial connection to: "+device+ "\tat "+std::to_string(baud)+"baud.";
+	return s;
+}
 
+std::string TCPServer::getMessage(){
+	std::string s = "Using TCP connection on port: "+std::to_string(port)+"\twith fd: "+std::to_string(clientFd);
+	return s;
+}
+
+
+
+void OutputPort::startLog(const OutputFlags& flgs){
+	try {
+		std::ofstream logFile("./log", std::ios::out);
+		if (!logFile.is_open())
+			throw std::runtime_error("Cannot open log file");
+		time_t time;
+		std::time(&time);
+		logFile << "\033[2JLOGGING BEGINNING AT: " << std::ctime(&time) << std::endl;
+		
+			
+		logFile << sink->getMessage() << std::endl;
+		} catch (const std::exception& e) {
+			std::cerr << e.what() << std::endl;
+			return;
+		}
+	return;
+}
+
+
+bool OutputPort::writeToFile(const char* data, size_t length){
+	try {
+		std::ofstream logFile;
+		logFile.open("./log", std::ios::app | std::ios::out);
+		if (!logFile.is_open())
+			throw std::runtime_error("Cannot open log file");
+	
+		logFile << std::hex << std::setfill('0');
+
+		for (size_t i=0; i < length; i++){
+			logFile << std::setw(2) << static_cast<int>(data[i]);
+		}
+		
+		logFile << std::endl;
+		
+	} catch (const std::exception& e) {
+		std::cerr << e.what() << std::endl;
+		return false;
+	}
+	return true;
+}
+
+bool OutputPort::init(const OutputFlags& flags) {
+	
+	
     // ---- Load shared key ----
     std::vector<uint8_t> key;
     while (key.empty()) {
@@ -331,7 +395,10 @@ bool OutputPort::init(const OutputFlags& flags) {
         if (promptYN("Use TCP output? (Uses IPv4)", flags.noPrompt, /*defaultYes=*/true)) {
             uint16_t port = promptPort(flags.noPrompt);
             sink = std::make_unique<TCPServer>(port, key);
-            if (sink->open()) return true;
+            if (sink->open()) {
+				if ((this->isLogging = flags.logging)) startLog(flags);;
+				return true;
+			}
             std::cerr << "[Output] TCP failed to open." << std::endl;
             sink.reset();
         }
@@ -346,7 +413,10 @@ bool OutputPort::init(const OutputFlags& flags) {
             std::cout << "\n[Output] USB gadget serial detected (" << gadgetDev << ")." << std::endl;
             if (promptYN("Use USB gadget serial output?", flags.noPrompt, /*defaultYes=*/true)) {
                 sink = std::make_unique<SerialPort>(gadgetDev);
-                if (sink->open()) return true;
+					if ((isLogging = flags.logging)) startLog(flags);
+                if (sink->open()) {
+					return true;
+				}
                 std::cerr << "[Output] Gadget serial failed to open." << std::endl;
                 sink.reset();
             }
@@ -363,5 +433,6 @@ bool OutputPort::init(const OutputFlags& flags) {
 }
 
 void OutputPort::writeData(const uint8_t* data, size_t length) {
+	if (isLogging) writeToFile(reinterpret_cast<const char*> (data), length);
     if (sink) sink->writeData(data, length);
 }

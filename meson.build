@@ -1,6 +1,6 @@
 project('number-generator-app', 'cpp',
   version : '0.1',
-  default_options : ['cpp_std=c++20', 'optimization=1'])
+  default_options : ['cpp_std=c++20', 'optimization=0'])
   
 # 1. Find the libcamera dependency (uses pkg-config under the hood)
 libcamera_dep = dependency('libcamera', required : true)
