@@ -35,17 +35,18 @@
 #include <openssl/err.h>
 
 static constexpr size_t AES_KEY_LEN   = 32; // AES-256
-static constexpr size_t GCM_NONCE_LEN = 12; // 96-bit nonce, standard for GCM
+static constexpr size_t GCM_NONCE_LEN = 12; // 96-bit nonce for GCM
 static constexpr size_t GCM_TAG_LEN   = 16; // 128-bit authentication tag
 
 // CLI flags passed in from main, forwarded into OutputPort::init()
 struct OutputFlags {
-    bool forceSerial  = false; // -s / --serial
-    bool noPrompt     = false; // -n / --no-input  (skip y/n, take defaults)
-	bool verbose		  = false; // -q / 
-	bool pseudo		  = false; // -p / prng to increase throughput.
-	bool logging	  = false; // -l /
-	bool force_calibrate	= false; // -l /
+    bool forceSerial    = false;    // -s / --serial
+    bool noPrompt       = false;    // -n / --no-input  (skip y/n, take defaults)
+	bool verbose	    = false;    // -q / 
+	bool pseudo		    = true;     // -p / prng to increase throughput + more secure
+	bool logging	    = false;    // -l / output log file, 
+    bool binary_output  = false;    // -lb/ write just the data, no preamble or formatting.
+	bool force_calibrate = false;   // -f /  
 };
 
 std::vector<uint8_t> loadSharedKey(const std::string& path = "/key");
@@ -54,7 +55,7 @@ std::vector<uint8_t> aesGcmEncrypt(const uint8_t* plaintext, size_t length,
                                     const std::vector<uint8_t>& key);
 
 
-// ======================== TRANSPORT PARENT CLASS ========================
+// ------------------------ TRANSPORT PARENT CLASS ------------------------
 
 class DataSink {
 public:
@@ -65,7 +66,7 @@ public:
 	virtual std::string getMessage() = 0;
 };
 
-// ======================== SERIAL (IF GADGET MODE EXISTS) ========================
+// ------------------------ SERIAL (IF GADGET MODE EXISTS) ------------------------
 
 class SerialPort : public DataSink {
 public:
@@ -85,22 +86,20 @@ private:
     std::queue<std::shared_ptr<std::vector<uint8_t>>> writeQueue;
     std::mutex queueMutex;
     std::condition_variable queueCV;
+    bool isBinary;
 
     void writerLoop();
     bool writeAll(const uint8_t* data, size_t length);
 };
 
 
-// ======================== TCP SERVER ========================
-// Threadless — runs entirely on the caller's thread (the hash thread).
-// writeData() does a zero-timeout poll() on the server socket to pick up
-// any pending connection before each send, then writes synchronously.
-//
-// Wire format per frame:
-//   [4-byte total length, big-endian]  — covers nonce + tag + ciphertext
-//   [12-byte nonce]
-//   [16-byte GCM tag]
-//   [N-byte ciphertext]
+// ------------------------ TCP SERVER ------------------------
+
+// Wire format per packet:
+//   [4-bytes  : total length] 
+//   [12-bytes : nonce]
+//   [16-bytes : GCM tag]
+//   [N-bytes  : ciphertext]
 
 class TCPServer : public DataSink {
 public:
@@ -109,9 +108,6 @@ public:
     ~TCPServer();
     bool open() override;
 
-    // Called from the hash thread. Polls for a new client connection,
-    // then encrypts and sends synchronously. If the client has disconnected,
-    // the frame is discarded and the server waits for the next connection.
     void writeData(const uint8_t* data, size_t length) override;
 
     void close() override;
@@ -124,26 +120,23 @@ private:
     int clientFd;
     std::vector<uint8_t> key;
 
-    // Non-blocking check for a pending connection on serverFd.
-    // Replaces clientFd if a new client has connected.
     void pollAccept();
 
     bool writeAll(int fd, const uint8_t* data, size_t length);
 };
 
 
-// ======================== OUTPUT PORT ========================
+// ------------------------ OUTPUT PORT ------------------------
 
 class OutputPort {
 public:
     OutputPort() = default;
     ~OutputPort() = default;
 
-    // flags come from CLI parsing in main().
     bool init(const OutputFlags& flags);
-    void writeData(const uint8_t* data, size_t length);
 	void startLog(const OutputFlags& flgs);
-	bool writeToFile(const char* data, size_t length);
+    void writeData(const uint8_t* data, size_t length, bool isBinary);
+	bool writeToFile(const uint8_t* data, size_t length, bool isBinary);
 
 private:
     std::unique_ptr<DataSink> sink;

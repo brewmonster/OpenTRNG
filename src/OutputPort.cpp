@@ -1,7 +1,7 @@
 #include "OutputPort.hpp"
 
 
-// ======================== KEY LOADING ========================
+// ------------------------ KEY LOADING ------------------------
 
 std::vector<uint8_t> loadSharedKey(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
@@ -18,7 +18,7 @@ std::vector<uint8_t> loadSharedKey(const std::string& path) {
 }
 
 
-// ======================== AES-256-GCM ENCRYPTION ========================
+// ------------------------ AES-256-GCM ENCRYPTION ------------------------
 
 std::vector<uint8_t> aesGcmEncrypt(const uint8_t* plaintext, size_t length,
                                     const std::vector<uint8_t>& key) {
@@ -47,7 +47,7 @@ std::vector<uint8_t> aesGcmEncrypt(const uint8_t* plaintext, size_t length,
 }
 
 
-// ======================== SERIAL ========================
+// ------------------------ SERIAL ------------------------
 
 SerialPort::SerialPort(const std::string& device, speed_t baud)
     : device(device), baud(baud), fd(-1) {}
@@ -141,7 +141,7 @@ bool SerialPort::writeAll(const uint8_t* data, size_t length) {
 
 
 
-// ======================== TCP SERVER ========================
+// ------------------------ TCP SERVER ------------------------
 
 TCPServer::TCPServer(uint16_t port, std::vector<uint8_t> key)
     : port(port), serverFd(-1), clientFd(-1), key(std::move(key)) {}
@@ -187,7 +187,7 @@ bool TCPServer::open() {
 }
 
 void TCPServer::pollAccept() {
-    // Zero-timeout poll — returns immediately with however many fds are ready
+    
     struct pollfd pfd{ serverFd, POLLIN, 0 };
     if (poll(&pfd, 1, 0) <= 0) return; // nothing pending
 
@@ -247,7 +247,7 @@ bool TCPServer::writeAll(int fd, const uint8_t* data, size_t length) {
 
 
 
-// ======================== OUTPUT PORT ========================
+// ------------------------ OUTPUT PORT ------------------------
 
 bool OutputPort::isGadgetModeAvailable() {
     const std::string udcPath = "/sys/class/udc";
@@ -325,18 +325,19 @@ std::string TCPServer::getMessage(){
 }
 
 
-
+// Generate the preamble to the logging file
 void OutputPort::startLog(const OutputFlags& flgs){
 	try {
 		std::ofstream logFile("./log", std::ios::out);
 		if (!logFile.is_open())
 			throw std::runtime_error("Cannot open log file");
+            
 		time_t time;
 		std::time(&time);
+
 		logFile << "\033[2JLOGGING BEGINNING AT: " << std::ctime(&time) << std::endl;
-		
-			
 		logFile << sink->getMessage() << std::endl;
+
 		} catch (const std::exception& e) {
 			std::cerr << e.what() << std::endl;
 			return;
@@ -344,21 +345,24 @@ void OutputPort::startLog(const OutputFlags& flgs){
 	return;
 }
 
-
-bool OutputPort::writeToFile(const char* data, size_t length){
+// Writes to "./log" file, in either of 2 modes, detailed / hex output or raw binary for easier debug / validation.
+bool OutputPort::writeToFile(const uint8_t* data, size_t length, bool isBinary){
 	try {
 		std::ofstream logFile;
-		logFile.open("./log", std::ios::app | std::ios::out);
-		if (!logFile.is_open())
-			throw std::runtime_error("Cannot open log file");
-	
-		logFile << std::hex << std::setfill('0');
-
-		for (size_t i=0; i < length; i++){
-			logFile << std::setw(2) << static_cast<int>(data[i]);
-		}
+        auto outputMode = (isBinary) ? (std::ios::binary) : (std::ios::app | std::ios::out); // either overwrite preamble and output as raw binary, or format with 
+		logFile.open("./log", outputMode);
 		
-		logFile << std::endl;
+        if (!logFile.is_open())
+			throw std::runtime_error("Cannot open log file");
+
+        if (!isBinary){
+            logFile << std::hex << std::setfill('0');
+            for (size_t i=0; i < length; i++)
+                logFile << std::setw(2) << data[i];
+            logFile << std::endl;
+        } else {
+            logFile.write(reinterpret_cast<const char*> (data), length); 
+        }
 		
 	} catch (const std::exception& e) {
 		std::cerr << e.what() << std::endl;
@@ -370,7 +374,7 @@ bool OutputPort::writeToFile(const char* data, size_t length){
 bool OutputPort::init(const OutputFlags& flags) {
 	
 	
-    // ---- Load shared key ----
+    // Loading the shared key from a file in the working directory
     std::vector<uint8_t> key;
     while (key.empty()) {
         try {
@@ -389,10 +393,10 @@ bool OutputPort::init(const OutputFlags& flags) {
         }
     }
 
-    // ---- Priority 1: TCP (unless --serial forced) ----
+    // ---- Priority 1 TCP (unless --serial forced) ----
     if (!flags.forceSerial) {
         std::cout << "\n[Output] Network (TCP) is available." << std::endl;
-        if (promptYN("Use TCP output? (Uses IPv4)", flags.noPrompt, /*defaultYes=*/true)) {
+        if (promptYN("Use TCP output? (Uses IPv4)", flags.noPrompt, true)) {
             uint16_t port = promptPort(flags.noPrompt);
             sink = std::make_unique<TCPServer>(port, key);
             if (sink->open()) {
@@ -406,12 +410,12 @@ bool OutputPort::init(const OutputFlags& flags) {
         std::cout << "\n[Output] --serial flag set, skipping TCP." << std::endl;
     }
 
-    // ---- Priority 2: USB gadget serial ----
+    // ---- Priority 2 USB gadget serial ----
     if (isGadgetModeAvailable()) {
         const std::string gadgetDev = "/dev/ttyGS0";
         if (std::filesystem::exists(gadgetDev)) {
             std::cout << "\n[Output] USB gadget serial detected (" << gadgetDev << ")." << std::endl;
-            if (promptYN("Use USB gadget serial output?", flags.noPrompt, /*defaultYes=*/true)) {
+            if (promptYN("Use USB gadget serial output?", flags.noPrompt, true)) {
                 sink = std::make_unique<SerialPort>(gadgetDev);
 					if ((isLogging = flags.logging)) startLog(flags);
                 if (sink->open()) {
@@ -432,7 +436,7 @@ bool OutputPort::init(const OutputFlags& flags) {
     return false;
 }
 
-void OutputPort::writeData(const uint8_t* data, size_t length) {
-	if (isLogging) writeToFile(reinterpret_cast<const char*> (data), length);
+void OutputPort::writeData(const uint8_t* data, size_t length, bool isBinary) {
+	if (isLogging) writeToFile(data, length, isBinary);
     if (sink) sink->writeData(data, length);
 }

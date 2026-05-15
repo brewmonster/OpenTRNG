@@ -21,4 +21,4 @@ public:
     void reset();
 };
 
-#endif // HASH_DIGESTER_HPP
+#endif 

@@ -14,18 +14,20 @@
 
 #include <linux/dma-buf.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h> // for accessing dma data
+#include <sys/mman.h> 
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <pthread.h>
 
 #include <bit> 
+#include <any>
 
 #include <libcamera/libcamera.h>
 
 
-#include "MarkovEstimator.hpp"
+#include "Estimator.hpp"
 #include "EntropyCalibrator.hpp"
+#include "OutputPort.hpp"
 
 
 using namespace libcamera;
@@ -38,11 +40,18 @@ enum Mode {
     RGB=2,
 };
 
+struct OutputSignal {
+    std::mutex mtx;
+    std::condition_variable cv;
+    int sourceID = -1; // -1 = none
+};
+
+
 class EntropySource {
 
     private:
         
-        
+        size_t ID;
         Mode format;
 
         std::shared_ptr<Camera>  camera; 
@@ -53,19 +62,22 @@ class EntropySource {
         size_t queueLimit;
         Request* currentRequest = nullptr;
         Request* oldRequest = nullptr;
+		size_t shift_amount = 0; // for rotating the byte values to reduce bias from specific colour wells in RAW/RGB modes
 		
-		CalibrationResult calibrationResult{};
-		
-
-
         Stream* stream = nullptr;
         
+        // used for tracking entropy over time.
+        std::vector<std::vector<uint8_t>> longSampleBuffer; // reduced data, longer time scale.
+        double H_min;
 
 
         std::map<const int, uint8_t*> bufferMappedData; // Map buffer pointers to mapped data
         
-        std::queue<std::vector<uint8_t>*>* queue = nullptr;
-		std::mutex& frm_q_mtx;
+        std::queue<std::unique_ptr<std::vector<uint8_t>>> frameQueue;
+        OutputSignal* outputSignal;
+        OutputFlags flags;
+        bool collectingEntropy = false;
+
         uint8_t* processBuffer(FrameBuffer* bufferPtr);
         std::vector<uint8_t> compareBuffers(uint8_t* currentData, uint8_t* oldData, size_t length);
         
@@ -74,29 +86,36 @@ class EntropySource {
         std::condition_variable pendingCV;
         
         void processRequest(Request *request);
+        
+        void calibrateHmin();
+
 
     public:
+
+        size_t CALIBRATE_N_FRAMES  = 10000;
+        size_t FRAME_KEEP          = 8;
+        float  SAFETY_MARGIN       = 2.0f;
     
         EntropySource(std::shared_ptr<Camera> _camera, 
-			std::queue<std::vector<uint8_t>*>* _queue, 
-			const std::atomic<bool>* _running, 
-			std::mutex& _frame_queue_mutex);
+        const std::atomic<bool>* _running, 
+        OutputSignal* _outputSignal, size_t& _id, OutputFlags _flags);
         
         EntropySource();
 
         ~EntropySource();
 		
 		void calibrate(uint32_t timeout_ms = 30000, bool force_calibrate = false);
-        
+
         void requestComplete(Request *request);
         
         void workingLoop();
 
         size_t size();
+        size_t getChunkSize(size_t hashLength);
+        std::unique_ptr<std::vector<uint8_t>> getNextFrame(); 
         
-
         int init(size_t _queue_limit);
 
 };
 
-#endif
+#endif // 

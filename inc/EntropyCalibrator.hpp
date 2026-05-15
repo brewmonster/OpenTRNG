@@ -5,289 +5,288 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
+#include <sstream>
 #include <chrono>
 #include <thread>
 #include <cmath>
 #include <string>
 #include <optional>
 #include <functional>
+#include <memory>
 #include <libcamera/libcamera.h>
-#include "MarkovEstimator.hpp"
+#include "Estimator.hpp"
+#include "OutputPort.hpp"
 
-// ============================================================
-// EntropyCalibrator
-//
-// Finds the camera exposure + gain settings that maximise
-// sensor noise entropy, using the Markov estimator on processed
-// frame data from the existing frameQueue.
-//
-// Phase 1 — Plateau search:
-//   Increase exposure in coarse steps. At each step collect
-//   frames and measure H_min. Stop when H_min stops improving
-//   (plateaus) — that is the sensor noise ceiling.
-//
-// Phase 2 — Fine trim:
-//   Binary search around the plateau exposure to find the
-//   smallest exposure that still achieves plateau-level H_min.
-//   Smaller exposure = higher framerate = more entropy/second.
-//
-// Phase 3 — Markov validation + persist.
-//
-// On subsequent runs, loads cached settings and does a quick
-// H_min check before deciding to re-calibrate.
-//
-// FrameCallback signature:
-//   void(std::vector<uint8_t>& accum, size_t nFrames)
-// ============================================================
+struct SweepParam {
+    double      min{};
+    double      max{};
+    double      current{};
+    double      step{};
+    double      best{};
+    int         confirmCount{};
 
-struct CalibrationResult {
-    int32_t exposureUs  = 100000;
-    float   gain        = 8.0f;
-    double  h_min       = 0.0;
-    bool    timedOut    = false;
-    bool    fromCache   = false;
+    const libcamera::ControlId*                          id{};
+    std::function<void(libcamera::ControlList&, double)> apply;
 };
 
-using FrameCallback = std::function<void(std::vector<uint8_t>&, size_t, int32_t, float)>;
+template<typename T>
+SweepParam makeSweepParam(const libcamera::Control<T>* ctrl) {
+    SweepParam p;
+    p.id    = ctrl;
+    p.apply = [ctrl](libcamera::ControlList& controls, double val) {
+        controls.set(*ctrl, static_cast<T>(val));
+    };
+    return p;
+}
+
+using SweepList        = std::vector<SweepParam>;
+using FrameCallback    = std::function<void(std::vector<uint8_t>&, size_t, SweepList&)>;
+using EstimationMethod = std::function<Estimator::Result(const uint8_t*, size_t)>;
 
 class EntropyCalibrator {
 public:
+    int PLATEAU_STEP_START      = 4;
+    int PLATEAU_STEP_REDUCTION  = 4;
+    int PLATEAU_STEP_MIN_SCALE  = 64;
+    int PLATEAU_CONFIRM_STEPS   = 2;
 
-    // Exposure bounds and step sizes (microseconds)
-    int32_t EXP_START       = 10000;   // 1ms
-    int32_t EXP_MAX         = 98000;  // 50ms
-    int32_t EXP_STEP_COARSE = 30000;   // 2ms — plateau search
-    int32_t EXP_STEP_FINE   = 1000;   // 10ms — trim searc
-	
-	float ANALOGUE_GAIN_START  = 1.0;  
-	float ANALOGUE_GAIN_MAX  = 8.0;  
-	float ANALOGUE_GAIN_STEP  = 1.0;
-	float ANALOGUE_GAIN_STEP_FINE  = 0.2;
- 
-
-    // Frames collected per measurement
-    static constexpr size_t  SAMPLE_FRAMES   = 6;
-    static constexpr size_t  QUICK_FRAMES    = 3;
-
-    // H_min must improve by at least this to not count as plateaued
-    static constexpr double  PLATEAU_MIN_GAIN = 0.05;   // 0.05 bits/byte
-
-    // Consecutive steps without improvement before confirming plateau
-    static constexpr int     PLATEAU_CONFIRM  = 2;
-
-    // Early exit if we hit near-theoretical max
-    static constexpr double  EARLY_EXIT_H     = 7.5;
-
-    // Cached settings degradation tolerance before re-calibrating
-    static constexpr double  RECHECK_TOLERANCE = 0.10;  // 10%
-
+    static constexpr size_t  SAMPLE_FRAMES     = 6;
+    static constexpr size_t  QUICK_FRAMES      = 3;
+    static constexpr double  EARLY_EXIT_H      = 7.5;
+    static constexpr double  RECHECK_TOLERANCE = 0.10;
     static constexpr const char* SETTINGS_PATH = "./calibration";
 
     EntropyCalibrator(std::shared_ptr<libcamera::Camera> cam,
-						libcamera::Stream*                 strm)
-						: camera(cam), stream(strm) {
-							
-		const libcamera::ControlInfoMap& controls = camera->controls();
+                      libcamera::Stream*                 strm,
+                      OutputFlags                        _flags)
+        : camera(cam), stream(strm), flags(_flags) {}
 
-		// Check if AnalogueGain is supported
-		auto it = controls.find(&libcamera::controls::AnalogueGain);
-		if (it != controls.end()) {
-			ANALOGUE_GAIN_START = it->second.min().get<float>();
-			ANALOGUE_GAIN_MAX = it->second.max().get<float>();
-			ANALOGUE_GAIN_STEP = (ANALOGUE_GAIN_MAX - ANALOGUE_GAIN_START) / 8;
-			ANALOGUE_GAIN_STEP_FINE = ANALOGUE_GAIN_STEP / 10;
-		}
-
-		// Same for ExposureTime
-		auto it2 = controls.find(&libcamera::controls::ExposureTime);
-		if (it2 != controls.end()) {
-			EXP_START = it2->second.min().get<int32_t>();
-			EXP_MAX = it2->second.max().get<int32_t>();
-			EXP_STEP_COARSE = (EXP_MAX - EXP_START) / 4;
-			EXP_STEP_FINE = EXP_STEP_COARSE / 10;
-		}
-	}
-
-    CalibrationResult run(FrameCallback frameCallback,
-                          uint32_t      timeout_ms = 600000,
-						  bool 			force_calibrate = false)  {
-		
-		// ------------------------ LOADING SAVED CALIBRATION ------------------------
-		if (!force_calibrate){
-			auto cached = loadSettings();
-			if (cached) {
-				std::cout << "[Calibration] Cached settings found:\n"
-						  << "  Exposure : " << cached->exposureUs << " us\n"
-						  << "  Gain     : " << cached->gain       << "\n"
-						  << "  H_min    : " << cached->h_min      << " bits/byte\n"
-						  << "[Calibration] Quick validation...\n";
-
-
-				std::vector<uint8_t> accum;
-				frameCallback(accum, QUICK_FRAMES, cached->exposureUs, cached->gain);
-				double checked_h = MarkovEstimator::estimate(accum).h_min;
-
-				double degradation = cached->h_min > 0.0 ?
-									(cached->h_min - checked_h) / cached->h_min
-									: 1.0;
-
-				std::cout << "  Checked H_min=" << std::fixed << std::setprecision(4)
-						  << checked_h << "  degradation=" << degradation * 100.0 << "%\n";
-
-				if (degradation <= RECHECK_TOLERANCE && degradation > 0.0) {
-					std::cout << "[Calibration] Cache still valid, skipping sweep.\n\n";
-					cached->fromCache = true;
-					return *cached;
-				}
-				std::cout << "[Calibration] Cache degraded, re-calibrating.\n";
-			} else {
-				std::cout << "[Calibration] No cache found, running full calibration.\n";
-			}
-		}
-		
+    double run(FrameCallback frameCallback,
+               uint32_t      timeout_ms      = 180000,
+               bool          force_calibrate = false)
+    {
+        // check for saved settings, and if they are still valid. 
+        // to avoid having to recalibrate every time.
+        if (!force_calibrate) {
+            double h_min = 0.0;
+            if (loadSettings(h_min)) {
+                std::cout << "[Calibration] Cached settings found, validating\n";
+                double checked_h   = measure(frameCallback, QUICK_FRAMES, Estimator::Estimate_Markov);
+                double degradation = h_min > 0.0 ? (h_min - checked_h) / h_min : 1.0;
+                std::cout << "  Checked H_min=" << std::fixed << std::setprecision(4)
+                          << checked_h << "  degradation=" << degradation * 100.0 << "%\n";
+                if (degradation <= RECHECK_TOLERANCE && degradation > 0.0) {
+                    std::cout << "[Calibration] Cache still valid, skipping sweep.\n\n";
+                    return checked_h;
+                }
+                std::cout << "[Calibration] Cache degraded, re-calibrating.\n";
+            } else {
+                std::cout << "[Calibration] No cache found, running full calibration.\n";
+            }
+        }
+        buildSweepList();
+        validateSweepList();
         return fullCalibration(frameCallback, timeout_ms);
     }
 
-
 private:
-
+    SweepList                          sweepList; // list of parameters to sweep through, ordered by expected impact on entropy (least -> most)
     std::shared_ptr<libcamera::Camera> camera;
     libcamera::Stream*                 stream;
-    float                              gain;
+    OutputFlags                        flags;
 
+    // Ordered in least -> most entropy impact for reducing saturation of pixels.
+    // Assuming start of sweep will be near fully saturated.
+    void buildSweepList() {
+        sweepList.clear();
+        sweepList.push_back(makeSweepParam(
+            static_cast<const libcamera::Control<float>*>(&libcamera::controls::DigitalGain)));
+        sweepList.push_back(makeSweepParam(
+            static_cast<const libcamera::Control<int32_t>*>(&libcamera::controls::ExposureTime)));
+        sweepList.push_back(makeSweepParam(
+            static_cast<const libcamera::Control<float>*>(&libcamera::controls::AnalogueGain)));
+    }
 
-    double measure(FrameCallback& cb, size_t nFrames, int32_t exposureUs, float analogueGain) { // call multipel frames and test the total entropy
+    void validateSweepList() {
+        const libcamera::ControlInfoMap& camControls = camera->controls();
+        std::vector<size_t> toRemove;
+
+        // Initialize sweep parameters and check control availability
+        for (size_t i = 0; i < sweepList.size(); ++i) {
+            auto& p      = sweepList[i];
+            bool  remove = false;
+            try {
+                auto it = camControls.find(p.id);
+                if (it == camControls.end())
+                    throw std::runtime_error("Control not found");
+
+                auto& bounds = it->second;
+                p.min     = bounds.min().get<double>();
+                p.max     = bounds.max().get<double>();
+
+                if (p.min == p.max) { // Check control has a range of values to sweep through
+
+                    std::cout << "Parameter " << p.id->name() << " has no range, skipping.\n";
+                    remove = true;
+                } else {
+                    p.step    = (p.max - p.min) / PLATEAU_STEP_START;
+                    p.current = p.max;
+                    p.best    = p.max;
+                }
+            } catch (const std::exception&) {
+                std::cout << "Cannot find " << p.id->name() << " parameter, skipping.\n";
+                remove = true;
+            }
+            if (remove) toRemove.push_back(i);
+        }
+        // Remove unsupported parameters in reverse order to avoid invalidating indices
+        for (auto it = toRemove.rbegin(); it != toRemove.rend(); ++it)
+            sweepList.erase(sweepList.begin() + static_cast<std::ptrdiff_t>(*it));
+
+        if (sweepList.empty())
+            throw std::runtime_error("No parameters to calibrate.");
+    }
+
+    void outputProgress(const std::string& message,
+                        std::chrono::steady_clock::time_point timeStarted,
+                        double h     = 0.0,
+                        double bestH = 0.0) {
+
+        auto time_taken = std::chrono::steady_clock::now() - timeStarted;
+        auto elapsed    = std::chrono::duration_cast<std::chrono::seconds>(time_taken).count();
+
+        std::cout << "\033[5A\033[2K" << message << "\n";
+
+        for (const auto& p : sweepList)
+            std::cout << "\033[2K  " << p.id->name() << " : " << p.current << "\n";
+        
+        std::string h_string = "";
+        if (h > 0.0) h_string += "H_min : " + std::to_string(h);
+        
+        std::cout << "\033[2K  " << h_string << " \t| Best: " << bestH << "bits/byte";
+        std::cout << (bestH < 3.0 ? "  [WARNING: low entropy]" : "  [Entropy OK]") << "\n";
+        std::cout << "\033[2K  Ran for: " << elapsed << "s\n" << std::flush;
+    }
+    // sample N frames and return the min-entropy estimate, applying the current sweep parameters
+    double measure(FrameCallback& cb, size_t nFrames, EstimationMethod method) {
         std::vector<uint8_t> accum;
-        cb(accum, nFrames, exposureUs, analogueGain);
+        cb(accum, nFrames, sweepList);
         if (accum.empty()) return 0.0;
-        return MarkovEstimator::estimate(accum).h_min;
+        return method(accum.data(), accum.size()).h_min;
     }
+    // Perform full calibration by sweeping through all parameters backwards, 
+    // to find optimal settings that maximise min-entropy. 
+    // If sensor is low ISO, Max settings will likely be best, so start there
+    // and work downwards to find the point of diminishing returns for each parameter.
+    // High ISO sensors might have to step down multiple parameters.
+    double fullCalibration(FrameCallback& frameCallback, uint32_t timeout_ms) {
+        using Clock = std::chrono::steady_clock;
+        auto start    = Clock::now();
+        auto deadline = start + std::chrono::milliseconds(timeout_ms / 2);
 
+        double bestH = 0.0;
+        std::cout << "\n\n\n\n\n";
 
-    CalibrationResult fullCalibration(FrameCallback& frameCallback,
-                                      uint32_t       timeout_ms) {
-										  
-		using Clock = std::chrono::steady_clock;
-        auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms / 2);
+        for (auto& p : sweepList) { // for each parameter
+            bool paramDone = false;
 
-		
-        double  bestH        = 0.0;
-		
-        float 	bestGain	 = ANALOGUE_GAIN_START;
-        int32_t bestExp		 = EXP_START;
-		
-		std::cout << "\n\n\n\n" << std::endl;
-		for (float gain = ANALOGUE_GAIN_START; gain < ANALOGUE_GAIN_MAX; gain += ANALOGUE_GAIN_STEP){
-			for (int32_t exposure = EXP_START; exposure < EXP_MAX; exposure += EXP_STEP_COARSE){
-				if (Clock::now() >= deadline) {
-					std::cout << "[Calibration] Timed out. \n";
-					goto CalibrateExit;
-				}
-				
-				double h = measure(frameCallback, SAMPLE_FRAMES, exposure, gain);
-				
-				if (h > bestH){
-					bestH = h;
-					bestGain = gain;
-					bestExp = exposure;
-				}
-				std::cout << "\033[4A\n[Calibration] Current iteration:\n"
-                  << "\033[2K  Exposure : " << exposure << " us   \t| Best:" << bestExp << "\n"
-                  << "\033[2K  Gain     : " << gain       << "  \t\t| Best:" << bestGain << "\n"
-                  << "\033[2K  H_min    : " << h      << " bits/byte  \t| Best:" << bestH 
-				  << (bestH < 3.0 ? "  [WARNING: low entropy]" : "  [OK]");
-				  
-				if (bestH >= EARLY_EXIT_H) goto CalibrateExit;
-			}
-		}
-		
-		if (bestGain+ANALOGUE_GAIN_STEP < ANALOGUE_GAIN_MAX) ANALOGUE_GAIN_MAX = bestGain+ANALOGUE_GAIN_STEP;
-		if (bestExp+EXP_STEP_COARSE < EXP_MAX) EXP_MAX = bestExp+EXP_STEP_COARSE;
-		
-		for (float gain = bestGain; gain < ANALOGUE_GAIN_MAX; gain += ANALOGUE_GAIN_STEP_FINE){
-			for (int32_t exposure = bestExp; exposure < EXP_MAX; exposure += EXP_STEP_FINE){
-				if (Clock::now() >= deadline) {
-						std::cout << "[Calibration] Timed out. \n";
-						goto CalibrateExit;
-					}
-				double h = measure(frameCallback, QUICK_FRAMES, exposure, bestGain);
-				if (h > bestH){
-					bestH = h;
-					bestGain = gain;
-					bestExp = exposure;
-				}
-				std::cout << "\033[4A\n[Calibration] Current iteration:\n"
-                  << "\033[2K  Exposure : " << exposure << " us   \t| Best:" << bestExp << "\n"
-                  << "\033[2K  Gain     : " << gain       << "  \t\t| Best:" << bestGain << "\n"
-                  << "\033[2K  H_min    : " << h      << " bits/byte  \t| Best:" << bestH  
-				  << (bestH < 3.0 ? "  [WARNING: low entropy]" : "  [OK]");
-			}
-		}
-		
+            while (!paramDone && p.current > p.min) {
+
+                if (Clock::now() >= deadline) {
+                    std::cout << "[Calibration] Timed out.\n";
+                    goto CalibrateExit;
+                }
+
+                double h = measure(frameCallback, SAMPLE_FRAMES, &Estimator::Estimate_Markov);
+
+                if (h > bestH) { // new best parameter setup
+                    bestH     = h;
+                    p.best    = p.current;
+                    p.current -= p.step;
+                } else {
+                    if (p.current >= p.best - p.step * PLATEAU_CONFIRM_STEPS) {
+                        p.current -= p.step;
+                    } else {
+                        p.current += p.step * PLATEAU_STEP_MIN_SCALE;
+                        p.step    /= PLATEAU_STEP_REDUCTION;
+                        if (p.step < (p.max - p.min) / PLATEAU_STEP_MIN_SCALE) {
+                            std::cout << "Parameter " << p.id->name()
+                                      << " plateaued at " << p.best << ".\n";
+                            p.current = p.best;
+                            paramDone = true;
+                        }
+                    }
+                }
+
+                outputProgress("Calibrating...", start, h, bestH);
+                if (bestH >= EARLY_EXIT_H) goto CalibrateExit;
+            }
+        }
+
 CalibrateExit:
-
-        CalibrationResult result;
-        result.gain = bestGain;
-		result.exposureUs = bestExp;
-		result.h_min = bestH;
-   
-        std::cout << "\033[4A\n[Calibration] Complete:\n"
-                  << "  Exposure : " << result.exposureUs << " us\n"
-                  << "  Gain     : " << result.gain       << "\n"
-                  << "  H_min    : " << result.h_min      << " bits/byte"
-				  << (bestH < 3.0 ? "  [WARNING: low entropy]" : "  [OK]\n\n");
-
-        saveSettings(result);
-        return result;
+        outputProgress("Calibration complete.", start, 0.0, bestH);
+        saveSettings(bestH);
+        return bestH;
     }
 
-
-    // ── Persistence ───────────────────────────────────────────
-    void saveSettings(const CalibrationResult& r) {
+    void saveSettings(double bestH) {
         std::ofstream f(SETTINGS_PATH);
         if (!f.is_open()) {
-            std::cerr << "[Calibration] Could not write to "
-                      << SETTINGS_PATH << "\n";
+            std::cerr << "[Calibration] Could not write to " << SETTINGS_PATH << "\n";
             return;
         }
         auto ts = std::chrono::duration_cast<std::chrono::seconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
-        f << r.exposureUs << "\n"
-          << r.gain       << "\n"
-          << r.h_min      << "\n"
-          << ts           << "\n";
-        std::cout << "[Calibration] Settings saved to " << SETTINGS_PATH << "\n";
+        for (const auto& p : sweepList)
+            f << p.id->name() << " " << p.best << "\n";
+        f << "H_min "     << bestH << "\n"
+          << "timestamp " << ts    << std::endl;
     }
 
-    std::optional<CalibrationResult> loadSettings() {
+    bool loadSettings(double& bestH) {
         std::ifstream f(SETTINGS_PATH);
-        if (!f.is_open()) return std::nullopt;
+        if (!f.is_open()) return false;
 
-        CalibrationResult r;
         int64_t ts = 0;
-        if (!(f >> r.exposureUs >> r.gain >> r.h_min >> ts)) {
-            std::cerr << "[Calibration] Settings file malformed.\n";
-            return std::nullopt;
+        std::string line;
+        // read settings from file. Format is "parameter_name value", one per line.
+        while (std::getline(f, line)) {
+            std::istringstream iss(line);
+            std::string key;
+            double      value;
+            if (!(iss >> key >> value)) {
+                std::cerr << "[Calibration] Settings file malformed.\n";
+                return false;
+            }
+
+            auto it = std::find_if(sweepList.begin(), sweepList.end(),
+                                   [&](const auto& p) { return p.id->name() == key; });
+            if (it != sweepList.end()) {
+                it->best = value;
+            } else if (key == "H_min") {
+                bestH = value;
+            } else if (key == "timestamp") {
+                ts = static_cast<int64_t>(value);
+            } else {
+                std::cerr << "[Calibration] Unknown key in settings: " << key << "\n";
+                return false;
+            }
         }
-
-        bool valid = r.exposureUs >  0
-                  && r.exposureUs <= 1000000
-                  && r.gain       >= 1.0f
-                  && r.gain       <= 16.0f
-                  && r.h_min      >  0.0
-                  && r.h_min      <= 8.0;
-
-        if (!valid) {
-            std::cerr << "[Calibration] Settings file out of range.\n";
-            return std::nullopt;
+        // check values are in bounds
+        for (const auto& p : sweepList) {
+            if (p.best < p.min || p.best > p.max) {
+                std::cerr << "[Calibration] Parameter " << p.id->name()
+                          << " out of bounds in settings file.\n";
+                return false;
+            }
         }
 
         auto now = std::chrono::duration_cast<std::chrono::seconds>(
                        std::chrono::system_clock::now().time_since_epoch()).count();
-        if (now - ts > 86400)
+        if (ts > 0 && now - ts > 86400)
             std::cout << "[Calibration] Warning: cached settings are "
                       << (now - ts) / 3600 << " hours old.\n";
 
-        return r;
+        return true;
     }
 };

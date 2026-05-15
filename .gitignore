@@ -40,7 +40,14 @@
 # debug information files
 *.dwo
 
-# build files
+# development files
+./.vscode/*
+.vscode/*
+
+# build files and binaies
 ./build/*
+/key
+/log
+/calibration
 
 

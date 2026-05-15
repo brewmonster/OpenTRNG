@@ -4,18 +4,47 @@ using namespace libcamera;
 using namespace std::chrono_literals;
 
 
-// expected size of data 
+// ------------------------ GETTERS ------------------------
+
+// Theortical max size for each method
 size_t EntropySource::size(){
     Span<const FrameBuffer::Plane> planes = currentRequest->findBuffer(stream)->planes();
-    
-    
-    // PixelFormatInfo::PixelFormatInfo &info = pixelFormatInfo::(format);
-    
-    if (format == Mode::RAW) return planes[0].length / 5; // optimised to use only 1/5 bytes 
-    if (format == Mode::GREYSCALE) return planes[0].length + planes[1].length + planes[2].length; // multiple planes, so total size is the sum of all plane sizes
+    if (format == Mode::RAW || format == Mode::GREYSCALE) return planes[0].length / 5; // optimised to use only 1/5 bytes 
     if (format == Mode::RGB) return planes[0].length * 4; // 4 bytes for every 1 pixel (1 pixel is actually 4 raw pixels)
     return 0; 
 }
+
+size_t EntropySource::getChunkSize(size_t hashLength){
+    if (frameQueue.empty()) return 0;
+    return H_min * frameQueue.front()->size() / (SAFETY_MARGIN * hashLength);
+}
+
+void EntropySource::calibrateHmin(){ // this will take a while if data is large enough.
+    if (frameQueue.size() <= queueLimit - frameQueue.size()){
+        std::cout << "No frames to estimate from" << std::endl;
+        return;
+    }
+    std::vector<uint8_t>* data;
+        for (size_t i = 0; i < FRAME_KEEP && !frameQueue.empty(); i++){
+            std::unique_ptr<std::vector<uint8_t>> frame = std::move(frameQueue.front());
+            frameQueue.pop();
+            data->insert(data->end(), frame->data(), frame->data() + frame->size()); // collapses the vector into 1 long data frame. warning this may take a lot of data.
+        }
+        
+	Estimator::Result r = Estimator::Estimate_Markov(data->data(), data->size());
+    H_min = r.h_min;
+}
+
+std::unique_ptr<std::vector<uint8_t>> EntropySource::getNextFrame() {
+    std::lock_guard<std::mutex> lock(outputSignal->mtx); 
+    if (frameQueue.empty()) return nullptr;
+
+    std::unique_ptr<std::vector<uint8_t>> frame = std::move(frameQueue.front());
+    frameQueue.pop();
+    return frame; 
+}
+
+// ------------------------ REQUEST HANDLING ------------------------
 
 uint8_t* EntropySource::processBuffer(FrameBuffer* bufferPtr) { 
     struct dma_buf_sync sync = {0};
@@ -28,7 +57,6 @@ uint8_t* EntropySource::processBuffer(FrameBuffer* bufferPtr) {
 
     uint8_t* mappedData = bufferMappedData[fd]; // Retrieve the mapped data pointer for this buffer
 
-    // --- STEP 3: END SYNC ---
     sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
     ioctl(fd, DMA_BUF_IOCTL_SYNC, &sync);
     return mappedData;
@@ -36,52 +64,43 @@ uint8_t* EntropySource::processBuffer(FrameBuffer* bufferPtr) {
 
 std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t* oldData, size_t length) {
     // Example comparison: Calculate the sum of absolute differences
-    // std::stringstream stream;
     std::vector<uint8_t> data;
-	int shift_amount = 0;
 	
 	// every 5th byte is 2 LSB its from the last 4 pixels, 
 	// to reduce bias, rotate byte based on index to set MSBs to different colour wells
-    if (format == Mode::RAW) {
+    // R10 also uses 5th byte for LSBs, so this method works for both RAW and RGB modes
+    if (format == Mode::RAW || format == Mode::RGB) {
 		data.reserve(length / 5);
-		
-		for (size_t i = 4; i < length / 5; i+=5) { 
-//			data.push_back(std::rotl( static_cast<uint8_t> (currentData[i]), shift_amount));
-			uint8_t byte = std::rotl(static_cast<uint8_t> (currentData[i] ^ oldData[i]), shift_amount); 
-			if (byte) {
+		uint8_t last_diff = 0;
+		uint8_t byte;
+		for (size_t i = 4; i < length - UINT8_MAX; i+=5) { 
+			uint8_t diff = currentData[i] - oldData[i+last_diff]; 
+			if (diff != last_diff) { // check if not 0 or 255
+				byte = std::rotl(static_cast<uint8_t> (diff - last_diff), shift_amount);
+				last_diff = diff;
 				data.push_back(byte);
-				if ((shift_amount+=1)>= 8) shift_amount = 0;
+                shift_amount += byte; 
+				shift_amount = (shift_amount + i) % 8; // rotate shift amount to rotate which colour well the bits are taken from, to reduce bias   
 			}
 		}
-		
 		return data;
     }
-	
-	// Also uses 5th byte for LSBs
-	if (format == Mode::GREYSCALE) {
-		data.reserve(length / 5);
-		for (size_t i = 4; i < length / 5; i+=5) { 
-			data.push_back(static_cast<uint8_t>(currentData[i] - oldData[i])); // get difference in each byte and add to sum, wrapping doesnt matter.
-		}
-		
-		return data;
-    }
-	
 	// RGB is formatted like R:8 B:8 G:8 X:8
 	// Loops through all RGB values, and takes the low bit data packs into 1/4 of size while maintaining entropy
     if (format == Mode::RGB) {
 		data.reserve((length * 3/4 ) / 4);
-		uint8_t current_byte = 0;
+		uint8_t bit_start = 0;
 		uint8_t shift_amount = 0;
-		
+		uint8_t current_byte = 0;
 		for (size_t i = 0; i < length; i++) { 
-			if ((i+1)%4){ // if not padding byte
-				if (shift_amount+=2 == 8) {
-					shift_amount = 0;
-					current_byte = 0; // new byte
-					data.push_back(current_byte);
-				}
-				current_byte |= ((static_cast<uint8_t> (currentData[i] - oldData[i]) & 0b00000011) << shift_amount); // taking last 2 bits from 4 bytes and packing into 1 byte
+			if ((i+1)%4){ // exclude padding bytes which have no data.
+                bit_start += 2;
+                bit_start %= 8;
+                if (bit_start == 0){ // if byte filled, push to vector and start new byte
+                    current_byte |= ((static_cast<uint8_t> (currentData[i] - oldData[i]) & 0b00000011) << bit_start); 
+                    data.push_back(current_byte);
+                    current_byte = 0;   // start of new packing byte
+                }
 			} 
 		}
 		
@@ -121,20 +140,31 @@ void EntropySource::processRequest(Request *request) {
         uint8_t* currentMappedData = processBuffer(currentBufferPtr);
         uint8_t* oldMappedData = processBuffer(oldBufferPtr);
 
-        std::vector<uint8_t>* frame_diff = new std::vector<uint8_t>(compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length)); 
+        auto frame_diff = std::make_unique<std::vector<uint8_t>>(compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length)); 
 		
-		std::lock_guard<std::mutex> lock(frm_q_mtx);
-        if (queue->size() < queueLimit){ // ensure requests are bound by the data processing, as to not cause a memory leak
-            queue->push(frame_diff); // pushing the mapped data pointer into the queue
+        if (!collectingEntropy)
+        std::lock_guard<std::mutex> lock(outputSignal->mtx);
+        if (frameQueue.size() < queueLimit){ // ensure requests are bound by the data processing, as to not cause a memory leak
+            frameQueue.push(std::move(frame_diff)); // pushing the mapped data pointer into the queue
         }
     }
-	
+}
+
+
+void EntropySource::requestComplete(Request *request) { 
+    if (request->status() == Request::RequestCancelled) return;
+    {
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        pendingRequests.push(request);
+    }
+    pendingCV.notify_one(); // wake the worker thread
 }
 
 void EntropySource::workingLoop() {
 	pthread_setname_np(pthread_self(), "Camera thread");
 	std::cout << "Camera Thread PID: " << syscall(SYS_gettid) << std::endl;
-
+    std::unique_ptr<std::lock_guard<std::mutex>> calibrateLock;
+    size_t counter = 0;
     while (running) {
         Request* request;
         {
@@ -146,31 +176,38 @@ void EntropySource::workingLoop() {
         }
         processRequest(request);
         
-    }
-}
+        if (CALIBRATE_N_FRAMES - (counter++) % CALIBRATE_N_FRAMES == FRAME_KEEP){ // recalibrating hmin every N frames
+            calibrateLock = std::make_unique<std::lock_guard<std::mutex>>(outputSignal->mtx);
+            collectingEntropy = true; // bypass the lock whereas main threads cannot.
+            queueLimit += FRAME_KEEP;
+            std::cout << "Re-Calibrating chunk size" << std::endl;
+        }  
 
-void EntropySource::requestComplete(Request *request) { 
-    if (request->status() == Request::RequestCancelled) return;
-    {
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        pendingRequests.push(request);
+        if(frameQueue.size() >= queueLimit && collectingEntropy == true){
+            collectingEntropy = false;
+            calibrateHmin(); // re-calibrate chunk size after N frames
+            calibrateLock.reset();
+            queueLimit -= FRAME_KEEP;
+            std::cout << "Re-Calibrating complete." << std::endl;
+        }
+        
     }
-    pendingCV.notify_one(); // wake the worker thread
 }
 
 int EntropySource::init(size_t _queue_limit) {
     
+
     // ------------------------ SETTING UP CAMERA CONFIGURATION ------------------------
     
     queueLimit = _queue_limit;
     
     camera->acquire();
     
-    std::vector<std::pair<StreamRole, PixelFormat>> roles = {   {StreamRole::Raw, 				formats::SGBRG10_CSI2P}, 
-                                                                {StreamRole::VideoRecording, 	formats::R10}, //  
-                                                                {StreamRole::Viewfinder, 		formats::RGBX8888} 
-																// RGBX8888 more compatible than RGB888 in terms of ISP requests.
+    std::vector<std::pair<StreamRole, PixelFormat>> roles = {   {StreamRole::Raw, 				formats::SGBRG10_CSI2P},    // Should be compatible on most cameras. Format facilitates highest performance  
+                                                                {StreamRole::VideoRecording, 	formats::R10},              // Greyscale
+                                                                {StreamRole::Viewfinder, 		formats::RGBX8888}          // RGBX8888 more compatible than RGB888 in terms of ISP requests.
                                                             };
+																
     std::unique_ptr<CameraConfiguration> config;
     
 	
@@ -186,8 +223,7 @@ int EntropySource::init(size_t _queue_limit) {
         for (const PixelFormat pxlFm : formats.pixelformats()){
             if (pxlFm == role.second){
                 streamConfig.pixelFormat = role.second;
-                format = static_cast<Mode>(i); // setting mode for future
-				std::cout << "Mode: " << role.second.toString() << std::endl;
+                format = static_cast<Mode>(i);   // setting mode for future
                 goto formatExit;
             }
         }
@@ -196,7 +232,7 @@ int EntropySource::init(size_t _queue_limit) {
     std::cerr << "No compatible formats found." << std::endl;
         return -1;
 	
-formatExit:
+formatExit: // 
 
 	StreamConfiguration& streamConfig = config->at(0); 
 
@@ -272,8 +308,7 @@ formatExit:
     for (unsigned int i = 0; i < buffers.size(); i++) { 
         // looping through all the buffers and asigning each one a request stream
         std::unique_ptr<Request> request = camera->createRequest();
-        if (!request)
-        {
+        if (!request) {
             std::cerr << "Can't create request" << std::endl;
             return -ENOMEM;
         }
@@ -298,54 +333,55 @@ formatExit:
 	startControls.set(libcamera::controls::AwbEnable, false);
 	camera->start(&startControls);
 
-	oldRequest = requests[0].get();
-	currentRequest = requests[1].get();
+	oldRequest      = requests[0].get();
+	currentRequest  = requests[1].get();
 
-	camera->queueRequest(oldRequest); // start flipflop
+	camera->queueRequest(oldRequest); // start flipflop by queueing just one.
 
     return 0;
 }
 
+
+
 void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate) {
 	
-    EntropyCalibrator cal(camera, stream);
+    EntropyCalibrator cal(camera, stream, flags);
 
-    auto frameCallback = [this](std::vector<uint8_t>& accum, size_t nFrames, int32_t exposureUs, float analogueGain) {
-        size_t collected = 0;
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-		
-        while (collected < nFrames && std::chrono::steady_clock::now() < deadline) {
-			if (collected < 2) { // first 2 new requests need controls applied
-				auto controls = currentRequest->controls();
-					controls.set(libcamera::controls::AeEnable,     false);
-					controls.set(libcamera::controls::AwbEnable,    false);
-					controls.set(libcamera::controls::ExposureTime, exposureUs);
-					controls.set(libcamera::controls::AnalogueGain, analogueGain);
-			}
-            std::vector<uint8_t>* frame = nullptr;
+    auto frameCallback = [this](std::vector<uint8_t>& accum, size_t nFrames, const SweepList& sweepList) {
+    size_t collected = 0;
+    auto deadline    = std::chrono::steady_clock::now() + std::chrono::seconds(600); // 10 minutes
 
-			if (!queue->empty()) { frame = queue->front(); queue->pop(); }
-            if (!frame) { 
-				std::this_thread::sleep_for(std::chrono::milliseconds(5)); 
-				continue;
-			}
-            accum.insert(accum.end(), frame->begin(), frame->end());
-            delete frame;
-            ++collected;
+    while (collected < nFrames && std::chrono::steady_clock::now() < deadline) {
+        if (collected < 2) {
+            auto& controls = currentRequest->controls(); 
+            for (auto& param : sweepList)
+                param.apply(controls);
         }
-    };
+
+        auto frame = getNextFrame();
+
+        if (!frame) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            continue;
+        }
+
+        accum.insert(accum.end(), frame->begin(), frame->end());
+        ++collected;
+    }
+};
 	
+    
     cal.run(frameCallback, timeout_ms);
 }
 
-
 EntropySource::EntropySource(std::shared_ptr<Camera> _camera, 
-	std::queue<std::vector<uint8_t>*>* _queue, 
 	const std::atomic<bool>* _running, 
-	std::mutex& _frame_queue_mutex) 
-	: camera(_camera), queue(_queue), running(_running), frm_q_mtx(_frame_queue_mutex) {}
+    OutputSignal* _outputSignal, size_t& _id, OutputFlags _flags)
+                        : camera(_camera), running(_running), 
+                        outputSignal(_outputSignal), ID(_id), flags(_flags) {}
 
 EntropySource::~EntropySource(){
     camera->stop();
     camera->release();
 }
+
