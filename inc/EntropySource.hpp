@@ -37,7 +37,8 @@ enum Mode {
     NONE=-1,
     RAW=0,
     GREYSCALE=1,
-    RGB=2,
+    YUV=2,
+    RGB=3,
 };
 
 struct OutputSignal {
@@ -57,7 +58,7 @@ class EntropySource {
         std::shared_ptr<Camera>  camera; 
         std::vector<std::unique_ptr<Request>> requests;
         
-        const std::atomic<bool>* running = nullptr;
+        const std::atomic<bool>& running;
         
         size_t queueLimit;
         Request* currentRequest = nullptr;
@@ -66,16 +67,16 @@ class EntropySource {
 		
         Stream* stream = nullptr;
         
-        // used for tracking entropy over time.
-        std::vector<std::vector<uint8_t>> longSampleBuffer; // reduced data, longer time scale.
-        double H_min;
+        // Used for tracking entropy over time.
+        std::vector<std::vector<uint8_t>> longSampleBuffer; // reduced data, longer time scale, for validation
+        Estimator::Result lastResult;
 
 
         std::map<const int, uint8_t*> bufferMappedData; // Map buffer pointers to mapped data
         
         std::queue<std::unique_ptr<std::vector<uint8_t>>> frameQueue;
         OutputSignal* outputSignal;
-        OutputFlags flags;
+        const OutputFlags flags;
         bool collectingEntropy = false;
 
         uint8_t* processBuffer(FrameBuffer* bufferPtr);
@@ -94,17 +95,17 @@ class EntropySource {
 
         size_t CALIBRATE_N_FRAMES  = 10000;
         size_t FRAME_KEEP          = 8;
-        float  SAFETY_MARGIN       = 2.0f;
+
     
         EntropySource(std::shared_ptr<Camera> _camera, 
-        const std::atomic<bool>* _running, 
+        const std::atomic<bool>& _running, 
         OutputSignal* _outputSignal, size_t& _id, OutputFlags _flags);
         
         EntropySource();
 
         ~EntropySource();
 		
-		void calibrate(uint32_t timeout_ms = 30000, bool force_calibrate = false);
+		void calibrate(uint32_t timeout_ms = 30000, bool force_calibrate = false, std::ofstream* log = nullptr);
 
         void requestComplete(Request *request);
         
@@ -112,6 +113,7 @@ class EntropySource {
 
         size_t size();
         size_t getChunkSize(size_t hashLength);
+        Estimator::Result getLastResult();
         std::unique_ptr<std::vector<uint8_t>> getNextFrame(); 
         
         int init(size_t _queue_limit);

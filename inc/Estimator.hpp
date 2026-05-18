@@ -21,7 +21,7 @@ private:
 
 
     
-    // FNV-1a rolling hash
+    // FNV-1a rolling hash @ https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
     struct ByteSpanHash {
         size_t operator()(std::string_view sv) const {
             size_t hash = 14695981039346656037; 
@@ -125,8 +125,8 @@ public:
             throw std::runtime_error("Estimator: insufficient data or no repeated tuples found");
 
         // step 4: p_u = p_hat + 2.576 * sqrt(p_hat * (1 - p_hat) / (L - 1))
-        double p_u = min(p_hat + 2.576 * std::sqrt((p_hat * (1.0 - p_hat)) 
-                            / static_cast<double>(n - 1)), 1.0); 
+        double p_u = std::min(p_hat + 2.576 * std::sqrt((p_hat * (1.0 - p_hat))
+                            / static_cast<double>(n - 1)), 1.0);
 
         // step 5: final min-entropy
         const double h_min = -std::log2(p_u); // done
@@ -162,12 +162,12 @@ public:
         size_t ones = 0;
         for (size_t w = 0; w < n_words; ++w){
             uint64_t word = words[w];
+            ones += __builtin_popcountll(word);
             for (uint8_t bit = 0; bit < 63; bit+=2){
                 uint8_t key = word & 0b11; // last 2 bits = transition state e.g 01: 0->1
                 transition_count[key]++;
                 word = word >> 2;
             }
-            ones += __builtin_popcountll(word);
         }     
 
         // Initial probabilities

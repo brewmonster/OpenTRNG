@@ -4,7 +4,7 @@ using namespace libcamera;
 using namespace std::chrono_literals;
 
 
-// ------------------------ GETTERS ------------------------
+// ------------------------ GETTERS / SETTERS ------------------------
 
 // Theortical max size for each method
 size_t EntropySource::size(){
@@ -14,32 +14,31 @@ size_t EntropySource::size(){
     return 0; 
 }
 
-size_t EntropySource::getChunkSize(size_t hashLength){
-    if (frameQueue.empty()) return 0;
-    return H_min * frameQueue.front()->size() / (SAFETY_MARGIN * hashLength);
+Estimator::Result EntropySource::getLastResult(){
+    return lastResult;
 }
 
-void EntropySource::calibrateHmin(){ // this will take a while if data is large enough.
+void EntropySource::calibrateHmin(){
     if (frameQueue.size() <= queueLimit - frameQueue.size()){
         std::cout << "No frames to estimate from" << std::endl;
         return;
     }
-    std::vector<uint8_t>* data;
+    std::vector<uint8_t> data;
         for (size_t i = 0; i < FRAME_KEEP && !frameQueue.empty(); i++){
             std::unique_ptr<std::vector<uint8_t>> frame = std::move(frameQueue.front());
             frameQueue.pop();
-            data->insert(data->end(), frame->data(), frame->data() + frame->size()); // collapses the vector into 1 long data frame. warning this may take a lot of data.
+            data.insert(data.end(), frame->data(), frame->data() + frame->size()); // collapses the vector into 1 long data frame. warning this may take a lot of data.
         }
-        
-	Estimator::Result r = Estimator::Estimate_Markov(data->data(), data->size());
-    H_min = r.h_min;
+	Estimator::Result r = Estimator::Estimate_Markov(data.data(), data.size());
+    lastResult = r;
 }
 
+// Only time frame can be read is when popping out a previous frame.
 std::unique_ptr<std::vector<uint8_t>> EntropySource::getNextFrame() {
     std::lock_guard<std::mutex> lock(outputSignal->mtx); 
     if (frameQueue.empty()) return nullptr;
 
-    std::unique_ptr<std::vector<uint8_t>> frame = std::move(frameQueue.front());
+    std::unique_ptr<std::vector<uint8_t>> frame = std::move(frameQueue.front()); // move the pointer owner.
     frameQueue.pop();
     return frame; 
 }
@@ -66,15 +65,15 @@ std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t
     // Example comparison: Calculate the sum of absolute differences
     std::vector<uint8_t> data;
 	
-	// every 5th byte is 2 LSB its from the last 4 pixels, 
+	// Every 5th byte is 2 LSB its from the last 4 pixels, 
 	// to reduce bias, rotate byte based on index to set MSBs to different colour wells
-    // R10 also uses 5th byte for LSBs, so this method works for both RAW and RGB modes
-    if (format == Mode::RAW || format == Mode::RGB) {
+    // R10 also uses 5th byte for LSBs, so this method works for both RAW and GREYSCALE modes
+    if (format == Mode::RAW || format == Mode::GREYSCALE) {
 		data.reserve(length / 5);
 		uint8_t last_diff = 0;
 		uint8_t byte;
 		for (size_t i = 4; i < length - UINT8_MAX; i+=5) { 
-			uint8_t diff = currentData[i] - oldData[i+last_diff]; 
+			uint8_t diff = currentData[i] - oldData[i+last_diff - last_diff%5]; 
 			if (diff != last_diff) { // check if not 0 or 255
 				byte = std::rotl(static_cast<uint8_t> (diff - last_diff), shift_amount);
 				last_diff = diff;
@@ -85,27 +84,28 @@ std::vector<uint8_t> EntropySource::compareBuffers(uint8_t* currentData, uint8_t
 		}
 		return data;
     }
-	// RGB is formatted like R:8 B:8 G:8 X:8
-	// Loops through all RGB values, and takes the low bit data packs into 1/4 of size while maintaining entropy
-    if (format == Mode::RGB) {
-		data.reserve((length * 3/4 ) / 4);
+
+
+	// RGB is formatted like R:8 B:8 G:8
+	// Loops through all RGB values, and takes the 2 LSBs, 
+    // packs into 1/4 of size while maintaining entropy
+    if (format == Mode::RGB || format == Mode::YUV) {
+		data.reserve(length / 4);
 		uint8_t bit_start = 0;
-		uint8_t shift_amount = 0;
 		uint8_t current_byte = 0;
 		for (size_t i = 0; i < length; i++) { 
-			if ((i+1)%4){ // exclude padding bytes which have no data.
-                bit_start += 2;
-                bit_start %= 8;
-                if (bit_start == 0){ // if byte filled, push to vector and start new byte
-                    current_byte |= ((static_cast<uint8_t> (currentData[i] - oldData[i]) & 0b00000011) << bit_start); 
-                    data.push_back(current_byte);
-                    current_byte = 0;   // start of new packing byte
-                }
-			} 
+            bit_start += 2;
+            bit_start %= 8;
+            current_byte |= ((static_cast<uint8_t> (currentData[i] - oldData[i]) & 0b00000011) << bit_start); 
+            if (bit_start == 0){ // if byte filled, push to vector and start new byte
+                data.push_back(current_byte);
+                current_byte = 0;   // start of new packing byte
+            }
 		}
 		
 		return data; 
 	}
+    
 	return {};
 }
 
@@ -115,11 +115,11 @@ void EntropySource::processRequest(Request *request) {
 
     if (request->status() == Request::RequestCancelled) return;
     
-	// flip flop between 2 buffers
+	// Flip flop between 2 buffers
     oldRequest = currentRequest; // frame from before
     currentRequest = request;    // The frame that just arrived
 	
-	// on first run only currentRequest holds a valid request, so can't flipflip yet 
+	// On first run only currentRequest holds a valid request, so can't flipflip yet 
 	// preloading the next request, since request processing will almost always take longer than the camera frame rate
     if (oldRequest) { 
         oldRequest->reuse(Request::ReuseBuffers);
@@ -132,18 +132,21 @@ void EntropySource::processRequest(Request *request) {
 
     if (oldRequest && currentRequest) {
        
-        // grab the buffer pointer of the requests
+        // Grab the buffer pointer of the requests
         FrameBuffer* currentBufferPtr = currentRequest->findBuffer(stream);
-        FrameBuffer* oldBufferPtr = oldRequest->findBuffer(stream);
+        FrameBuffer* oldBufferPtr     = oldRequest->findBuffer(stream); 
 
-        // getting virtual memory pointer equiavlent to the dma fd
+        // Getting virtual memory pointer equiavlent to the dma fd
         uint8_t* currentMappedData = processBuffer(currentBufferPtr);
-        uint8_t* oldMappedData = processBuffer(oldBufferPtr);
-
-        auto frame_diff = std::make_unique<std::vector<uint8_t>>(compareBuffers(currentMappedData, oldMappedData, currentBufferPtr->planes()[0].length)); 
+        uint8_t* oldMappedData     = processBuffer(oldBufferPtr);
+        
+        auto frame_diff = std::make_unique<std::vector<uint8_t>>(
+            compareBuffers(currentMappedData, oldMappedData, 
+                currentBufferPtr->planes()[0].length)
+            ); 
 		
-        if (!collectingEntropy)
-        std::lock_guard<std::mutex> lock(outputSignal->mtx);
+        std::unique_lock<std::mutex> lock(outputSignal->mtx);
+        if (collectingEntropy) lock.unlock();
         if (frameQueue.size() < queueLimit){ // ensure requests are bound by the data processing, as to not cause a memory leak
             frameQueue.push(std::move(frame_diff)); // pushing the mapped data pointer into the queue
         }
@@ -181,19 +184,21 @@ void EntropySource::workingLoop() {
             collectingEntropy = true; // bypass the lock whereas main threads cannot.
             queueLimit += FRAME_KEEP;
             std::cout << "Re-Calibrating chunk size" << std::endl;
-        }  
-
-        if(frameQueue.size() >= queueLimit && collectingEntropy == true){
-            collectingEntropy = false;
-            calibrateHmin(); // re-calibrate chunk size after N frames
-            calibrateLock.reset();
-            queueLimit -= FRAME_KEEP;
-            std::cout << "Re-Calibrating complete." << std::endl;
         }
-        
+        if (collectingEntropy) {
+            if (frameQueue.size() >= queueLimit) {
+                collectingEntropy = false;
+                calibrateHmin();
+                calibrateLock.reset();
+                queueLimit -= FRAME_KEEP;
+                std::cout << "Re-Calibrating complete." << std::endl;
+            }
+        } else {
+            outputSignal->sourceID = ID;
+            outputSignal->cv.notify_one();
+        }
     }
 }
-
 int EntropySource::init(size_t _queue_limit) {
     
 
@@ -202,25 +207,30 @@ int EntropySource::init(size_t _queue_limit) {
     queueLimit = _queue_limit;
     
     camera->acquire();
-    
-    std::vector<std::pair<StreamRole, PixelFormat>> roles = {   {StreamRole::Raw, 				formats::SGBRG10_CSI2P},    // Should be compatible on most cameras. Format facilitates highest performance  
-                                                                {StreamRole::VideoRecording, 	formats::R10},              // Greyscale
-                                                                {StreamRole::Viewfinder, 		formats::RGBX8888}          // RGBX8888 more compatible than RGB888 in terms of ISP requests.
-                                                            };
-																
+    using RoleList = std::vector<std::pair<StreamRole, PixelFormat>>;
+    RoleList roles = {  {StreamRole::Raw, 				formats::SGBRG10_CSI2P}, // Should be compatible on most cameras. Format facilitates highest performance  
+                        {StreamRole::Viewfinder, 	    formats::R10},           // Greyscale
+                        {StreamRole::Viewfinder, 	    formats::NV12},          // Planar YUV to separate Y from UV
+                        {StreamRole::Viewfinder, 		formats::RGB888}         // RGBX8888 more compatible than RGB888 in terms of ISP requests.
+                    };
+
     std::unique_ptr<CameraConfiguration> config;
-    
-	
+
+                                                     
     // Checking if there are compatible formats
     for (int i = 0; const std::pair<StreamRole, PixelFormat>& role : roles){
-        
         config = camera->generateConfiguration( {role.first} );
         if (config == nullptr) continue; // returns nullptr if can't configure
         
         StreamConfiguration& streamConfig = config->at(0); 
         const StreamFormats &formats = streamConfig.formats();
         
+        if (flags.verbose) {
+            std::cout << "Role: " << role.first << "\n";
+            std::cout << "Supported pixel formats:\n";
+        }
         for (const PixelFormat pxlFm : formats.pixelformats()){
+            if (flags.verbose) std::cout << "  " << pxlFm.toString() << "\n";
             if (pxlFm == role.second){
                 streamConfig.pixelFormat = role.second;
                 format = static_cast<Mode>(i);   // setting mode for future
@@ -232,9 +242,15 @@ int EntropySource::init(size_t _queue_limit) {
     std::cerr << "No compatible formats found." << std::endl;
         return -1;
 	
-formatExit: // 
+formatExit: 
 
-	StreamConfiguration& streamConfig = config->at(0); 
+    // // // // // // Uncomment to force specific mode:
+    // config = camera->generateConfiguration({StreamRole::Viewfinder});
+    StreamConfiguration& streamConfig = config->at(0); 
+    // streamConfig.pixelFormat = formats::RGB888;
+    // format = Mode::YUV;   // setting mode for future
+
+	// StreamConfiguration& streamConfig = config->at(0); 
 
     camera->configure(config.get());
     
@@ -329,11 +345,11 @@ formatExit: //
     camera->requestCompleted.connect(this, &EntropySource::requestComplete);
 
 	libcamera::ControlList startControls(libcamera::controls::controls);
-	startControls.set(libcamera::controls::AeEnable,  false);
-	startControls.set(libcamera::controls::AwbEnable, false);
+	startControls.set(libcamera::controls::AeEnable,  false); // auto exposure
+	startControls.set(libcamera::controls::AwbEnable, false); // auto white balance
 	camera->start(&startControls);
 
-	oldRequest      = requests[0].get();
+	oldRequest      = requests[0].get(); 
 	currentRequest  = requests[1].get();
 
 	camera->queueRequest(oldRequest); // start flipflop by queueing just one.
@@ -343,9 +359,9 @@ formatExit: //
 
 
 
-void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate) {
-	
-    EntropyCalibrator cal(camera, stream, flags);
+void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate, std::ofstream* log) {
+
+    EntropyCalibrator cal(camera, stream, flags, log);
 
     auto frameCallback = [this](std::vector<uint8_t>& accum, size_t nFrames, const SweepList& sweepList) {
     size_t collected = 0;
@@ -355,7 +371,7 @@ void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate) {
         if (collected < 2) {
             auto& controls = currentRequest->controls(); 
             for (auto& param : sweepList)
-                param.apply(controls);
+                param.apply(controls, param.current); // lambda pointers to captures get destroyed, so have to reparse .current
         }
 
         auto frame = getNextFrame();
@@ -370,13 +386,13 @@ void EntropySource::calibrate(uint32_t timeout_ms, bool force_calibrate) {
     }
 };
 	
-    
-    cal.run(frameCallback, timeout_ms);
+    // lastResult = Estimator::Result({0.0, 0.5, 0});
+    lastResult = cal.run(frameCallback, timeout_ms);
 }
 
 EntropySource::EntropySource(std::shared_ptr<Camera> _camera, 
-	const std::atomic<bool>* _running, 
-    OutputSignal* _outputSignal, size_t& _id, OutputFlags _flags)
+	const std::atomic<bool>& _running, 
+    OutputSignal* _outputSignal, size_t& _id, const OutputFlags _flags)
                         : camera(_camera), running(_running), 
                         outputSignal(_outputSignal), ID(_id), flags(_flags) {}
 

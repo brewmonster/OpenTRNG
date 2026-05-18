@@ -34,19 +34,22 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
-static constexpr size_t AES_KEY_LEN   = 32; // AES-256
+static constexpr size_t AES_KEY_LEN   = 32; // AES-256 (32 * 8)
 static constexpr size_t GCM_NONCE_LEN = 12; // 96-bit nonce for GCM
 static constexpr size_t GCM_TAG_LEN   = 16; // 128-bit authentication tag
 
 // CLI flags passed in from main, forwarded into OutputPort::init()
 struct OutputFlags {
-    bool forceSerial    = false;    // -s / --serial
-    bool noPrompt       = false;    // -n / --no-input  (skip y/n, take defaults)
-	bool verbose	    = false;    // -q / 
-	bool pseudo		    = true;     // -p / prng to increase throughput + more secure
-	bool logging	    = false;    // -l / output log file, 
-    bool binary_output  = false;    // -lb/ write just the data, no preamble or formatting.
-	bool force_calibrate = false;   // -f /  
+    bool forceSerial     = false;   // -s  / --serial
+    bool noPrompt        = false;   // -n  / --no-input  (skip y/n, take defaults)
+    bool verbose         = false;   // -v  / --verbose
+    bool pseudo          = true;    // -h  / --hashes    (disable pseudo-hashing) 
+    bool logging         = false;   // -l  / --logging   (binary output log)
+    bool binary_output   = false;   // -lb / --logging-binary
+    bool force_calibrate = false;   // -f  / --force-calibrate
+    bool log_verbose     = false;   // -lv / --log-verbose       (save entropy stats to file)
+    bool log_calibration = false;   // -lc / --log-calibration   (save calibration steps to file)
+    bool log_performance = false;   // -lp / --log-performance   (only output performance)
 };
 
 std::vector<uint8_t> loadSharedKey(const std::string& path = "/key");
@@ -134,13 +137,10 @@ public:
     ~OutputPort() = default;
 
     bool init(const OutputFlags& flags);
-	void startLog(const OutputFlags& flgs);
-    void writeData(const uint8_t* data, size_t length, bool isBinary);
-	bool writeToFile(const uint8_t* data, size_t length, bool isBinary);
+    void writeData(const uint8_t* data, size_t length);
 
 private:
     std::unique_ptr<DataSink> sink;
-	bool isLogging;
 
     static bool isGadgetModeAvailable();
     static bool promptYN(const std::string& question, bool noPrompt, bool defaultYes = true);

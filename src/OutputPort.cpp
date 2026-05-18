@@ -140,7 +140,6 @@ bool SerialPort::writeAll(const uint8_t* data, size_t length) {
 }
 
 
-
 // ------------------------ TCP SERVER ------------------------
 
 TCPServer::TCPServer(uint16_t port, std::vector<uint8_t> key)
@@ -207,8 +206,8 @@ void TCPServer::pollAccept() {
 }
 
 void TCPServer::writeData(const uint8_t* data, size_t length) {
-    // Check for a new or replacement client before every send
-    pollAccept();
+    
+    pollAccept();             // Check for a new or replacement client before every send
 
     if (clientFd < 0) return; // no client yet, discard
 
@@ -243,8 +242,6 @@ bool TCPServer::writeAll(int fd, const uint8_t* data, size_t length) {
     }
     return true;
 }
-
-
 
 
 // ------------------------ OUTPUT PORT ------------------------
@@ -325,54 +322,8 @@ std::string TCPServer::getMessage(){
 }
 
 
-// Generate the preamble to the logging file
-void OutputPort::startLog(const OutputFlags& flgs){
-	try {
-		std::ofstream logFile("./log", std::ios::out);
-		if (!logFile.is_open())
-			throw std::runtime_error("Cannot open log file");
-            
-		time_t time;
-		std::time(&time);
-
-		logFile << "\033[2JLOGGING BEGINNING AT: " << std::ctime(&time) << std::endl;
-		logFile << sink->getMessage() << std::endl;
-
-		} catch (const std::exception& e) {
-			std::cerr << e.what() << std::endl;
-			return;
-		}
-	return;
-}
-
-// Writes to "./log" file, in either of 2 modes, detailed / hex output or raw binary for easier debug / validation.
-bool OutputPort::writeToFile(const uint8_t* data, size_t length, bool isBinary){
-	try {
-		std::ofstream logFile;
-        auto outputMode = (isBinary) ? (std::ios::binary) : (std::ios::app | std::ios::out); // either overwrite preamble and output as raw binary, or format with 
-		logFile.open("./log", outputMode);
-		
-        if (!logFile.is_open())
-			throw std::runtime_error("Cannot open log file");
-
-        if (!isBinary){
-            logFile << std::hex << std::setfill('0');
-            for (size_t i=0; i < length; i++)
-                logFile << std::setw(2) << data[i];
-            logFile << std::endl;
-        } else {
-            logFile.write(reinterpret_cast<const char*> (data), length); 
-        }
-		
-	} catch (const std::exception& e) {
-		std::cerr << e.what() << std::endl;
-		return false;
-	}
-	return true;
-}
 
 bool OutputPort::init(const OutputFlags& flags) {
-	
 	
     // Loading the shared key from a file in the working directory
     std::vector<uint8_t> key;
@@ -400,7 +351,6 @@ bool OutputPort::init(const OutputFlags& flags) {
             uint16_t port = promptPort(flags.noPrompt);
             sink = std::make_unique<TCPServer>(port, key);
             if (sink->open()) {
-				if ((this->isLogging = flags.logging)) startLog(flags);;
 				return true;
 			}
             std::cerr << "[Output] TCP failed to open." << std::endl;
@@ -417,7 +367,6 @@ bool OutputPort::init(const OutputFlags& flags) {
             std::cout << "\n[Output] USB gadget serial detected (" << gadgetDev << ")." << std::endl;
             if (promptYN("Use USB gadget serial output?", flags.noPrompt, true)) {
                 sink = std::make_unique<SerialPort>(gadgetDev);
-					if ((isLogging = flags.logging)) startLog(flags);
                 if (sink->open()) {
 					return true;
 				}
@@ -426,17 +375,16 @@ bool OutputPort::init(const OutputFlags& flags) {
             }
         } else {
             std::cout << "\n[Output] UDC present but " << gadgetDev
-                      << " not found — g_serial/g_cdc module may not be loaded." << std::endl;
+                      << " not found, g_serial/g_cdc module may not be loaded." << std::endl;
         }
     } else {
-        std::cout << "\n[Output] No USB Device Controller — gadget mode unavailable." << std::endl;
+        std::cout << "\n[Output] No USB Device Controller: gadget mode unavailable." << std::endl;
     }
 
     std::cerr << "\n[Output] No output transport could be established." << std::endl;
     return false;
 }
 
-void OutputPort::writeData(const uint8_t* data, size_t length, bool isBinary) {
-	if (isLogging) writeToFile(data, length, isBinary);
+void OutputPort::writeData(const uint8_t* data, size_t length) {
     if (sink) sink->writeData(data, length);
 }
